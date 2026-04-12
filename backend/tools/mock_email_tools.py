@@ -1,0 +1,1 @@
+# Mock email tool functions
