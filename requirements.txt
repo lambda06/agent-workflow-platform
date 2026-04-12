@@ -1,0 +1,13 @@
+fastapi==0.135.3  # Web server framework for the API
+uvicorn[standard]==0.44.0  # ASGI web server to run the FastAPI app
+langgraph==1.1.6  # Agent orchestration framework
+langchain-google-genai==4.2.1  # integration for Gemini LLM
+langchain-core==1.2.28  # Core abstractions for agent logic
+pydantic==2.12.5  # v2 data validation and serialization
+pydantic-settings==2.13.1  # Configuration management from environment variables
+asyncpg==0.31.0  # Async PostgreSQL driver for database interactions
+sqlalchemy[asyncio]==2.0.49  # Async ORM for Supabase database persistence
+upstash-redis==1.7.0  # Client for Upstash Redis caching
+langfuse==4.2.0  # Observability and tracing for LLM applications
+python-dotenv==1.2.2  # Local development support for loading .env files
+httpx==0.28.1  # Async HTTP client used by core integrations

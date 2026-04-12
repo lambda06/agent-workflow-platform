@@ -1,0 +1,1 @@
+# Mock database tool functions
