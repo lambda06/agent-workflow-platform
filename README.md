@@ -29,7 +29,7 @@ The most interesting part of this project? **The workflow engine can retry intel
 Phase 1 🔨  Foundation        — Project scaffold · Config · Models · Orchestration core
 Phase 2 🔨  Agent Nodes       — Coordinator · Extractor · Transformer · Integrator · Notifier
 Phase 3 📋  LangGraph Graph   — Full StateGraph · Conditional routing · Parallel branches
-Phase 4 📋  API Layer         — FastAPI endpoints · Request validation · Auth middleware
+Phase 4 📋  API Layer         — FastAPI endpoints · Request validation · Evaluator Agent · Auth middleware
 Phase 5 📋  Persistence       — Supabase schema · Alembic migrations · Result storage
 Phase 6 📋  Deployment        — Docker · CI/CD · Cloud
 ```
