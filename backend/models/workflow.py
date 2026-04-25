@@ -34,7 +34,6 @@ class AgentType(str, Enum):
     NOTIFICATION = "notification"
     COORDINATION = "coordination"
 
-
 class Task(BaseModel):
     """
     Represents a specific unit of work or instruction to be processed by a designated agent.
