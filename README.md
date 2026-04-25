@@ -15,7 +15,7 @@ The most interesting part of this project? **The workflow engine can retry intel
 | **API** | FastAPI · Uvicorn · Pydantic v2 |
 | **Agent Orchestration** | LangGraph · LangChain Core |
 | **LLM** | Google Gemini (`gemma-3-27b-it`) · `langchain-google-genai` |
-| **Database / Persistence** | Supabase PostgreSQL · SQLAlchemy async · `asyncpg` |
+| **Database / Persistence** | Supabase PostgreSQL · `psycopg[binary]` / `psycopg-pool` (Single Shared Pool) |
 | **Caching / State** | Upstash Redis (serverless REST API) |
 | **Observability** | Langfuse (tracing · spans · prompt versioning) |
 | **HTTP Client** | `httpx` (async, used by integration agents) |
@@ -27,9 +27,9 @@ The most interesting part of this project? **The workflow engine can retry intel
 
 ```
 Phase 1 🔨  Foundation        — Project scaffold · Config · Models · Orchestration core
-Phase 2 📋  Agent Nodes       — Coordinator · Extractor · Transformer · Executor · Notifier · Evaluator
+Phase 2 🔨  Agent Nodes       — Coordinator · Extractor · Transformer · Integrator · Notifier
 Phase 3 📋  LangGraph Graph   — Full StateGraph · Conditional routing · Parallel branches
-Phase 4 📋  API Layer         — FastAPI endpoints · Request validation · Auth middleware
+Phase 4 📋  API Layer         — FastAPI endpoints · Request validation · Evaluator Agent · Auth middleware
 Phase 5 📋  Persistence       — Supabase schema · Alembic migrations · Result storage
 Phase 6 📋  Deployment        — Docker · CI/CD · Cloud
 ```
@@ -111,6 +111,35 @@ Phase 6 📋  Deployment        — Docker · CI/CD · Cloud
 - **Where:** `backend/orchestration/state_manager.py`
 - **Cause:** Plain `list[str]` on a TypedDict field gives LangGraph no merge strategy. When two parallel agent nodes write to the same field simultaneously, the second write silently overwrites the first — IDs are lost with no error or warning.
 - **Fix:** All accumulator fields annotated with `Annotated[list[str], operator.add]`. LangGraph calls `operator.add(existing, new)` at merge time, concatenating both writes. This prevents ID loss, avoids graph deadlocks, and costs nothing at runtime.
+
+---
+
+## 🏗 Phase 2 — Agent Nodes & Orchestration ✅
+
+**Goal:** Implement the specialized agent workers, define the LangGraph execution flow, build mock tools for isolated testing, and validate the pipeline end-to-end. Focus explicitly on deterministic JSON generation, robust state persistence, and concurrent tool execution.
+
+### What was built
+
+- **Coordinator Agent** (`backend/agents/coordinator_agent.py`) — The workflow's planner segment. Uses Gemini's `with_structured_output` API tightly bound to a dynamic Pydantic schema to decompose a natural language request into a sequence of dependent tasks. Operates securely by writing its planned execution path directly into the `WorkflowState`.
+
+- **Action Agents** (`backend/agents/*.py`) — Highly constrained, specialized action nodes executing within the graph:
+  - **Extraction Agent:** Fetches data (e.g. invoices) using external tools and persists the raw JSON payloads into Supabase.
+  - **Transform Agent:** Applies strict structural/mathematical validations asynchronously across fetched data. Utilizes an independent, per-invoice transaction strategy ensuring malformed entries are routed to an errors table rather than failing the whole batch.
+  - **Integration Agent:** Submits transformed data to multiple external sources utilizing `asyncio.gather(return_exceptions=True)` to maximize throughput during concurrent tool executions.
+  - **Notification Agent:** End-of-the-line node. Interrogates runtime accumulators from internal state to formulate human-readable, deterministic summaries directly to Slack before sealing the graph completion.
+
+- **Mock Tool Ecosystem** (`backend/tools/*.py`) — Local stubs substituting enterprise software (e.g., Salesforce CPQ, Gmail APIs, Slack webhooks). Returns hardcoded datasets containing specific edge cases (e.g., invalid arithmetic, missing fields) rigorously engineered to stress-test the Transform logic.
+
+- **LangGraph Compilation Flow** (`backend/orchestration/langgraph_workflow.py`) — Connects the distinct agent actions. Injects conditional edge routing post-coordinator to map the LLM's dynamic task list stringently against physical graph nodes. Incorporates an optional `AsyncPostgresSaver` checkpointer for state resilience across executions.
+
+- **End-to-End Smoke Test** (`backend/tests/smoke_test_e2e.py`) — Instantiates an isolated workflow run locally. Iterates over the running `astream` chunking mechanism and performs seven critical system assertions validating successful progression across every independent node, returning a clear `0` on success.
+
+### 🐛 Issues Encountered & Resolutions
+
+**Issue 1: Database Connection Proliferation & Driver Conflict (Crucial Architectural Change)**
+- **Where:** Across all agent nodes, `backend/db/pool.py`, and `backend/main.py`.
+- **Cause:** Initial plans had every agent establishing an isolated, lazy-loaded `asyncpg` pool (`min_size=2`). Parallel to this, LangGraph's `AsyncPostgresSaver` inherently utilizes `psycopg3`. Combining two varying wire-protocol drivers in tandem accessing a low-connection-limit Supabase database caused immediate exhaustion and fatal SSL negotiation conflicts.
+- **Fix:** Jettisoned `asyncpg` and unused `sqlalchemy[asyncio]` dependencies across the entire project. Re-tooled to use a single, unified `AsyncConnectionPool` instantiated exclusively by `psycopg-pool`. Wired this global pool at FastAPIs startup `lifespan` hook directly into both agent DB handlers and LangGraphs native checkpointer—eliminating dual-driver overhead and connection sprawl gracefully.
 
 ---
 
@@ -197,7 +226,7 @@ agent-workflow-platform/
 | Variable | Required | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | ✅ | Google Gemini API key for LLM calls |
-| `SUPABASE_DATABASE_URL` | ✅ | Async PostgreSQL connection string (`postgresql+asyncpg://...`) |
+| `SUPABASE_DATABASE_URL` | ✅ | Async PostgreSQL connection string (`postgresql://...`) |
 | `UPSTASH_REDIS_REST_URL` | ✅ | Upstash Redis REST endpoint URL |
 | `UPSTASH_REDIS_REST_TOKEN` | ✅ | Upstash Redis REST token |
 | `LANGFUSE_PUBLIC_KEY` | ✅ | Langfuse public key for tracing |
