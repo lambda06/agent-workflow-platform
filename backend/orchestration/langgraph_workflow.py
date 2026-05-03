@@ -64,7 +64,7 @@ Module-level `workflow`:
     level for use in tests and scripts that don't need persistence. Production code
     should call get_runnable_workflow(checkpointer=<AsyncPostgresSaver instance>).
 
-evaluator_agent (Phase 4):
+evaluator_agent (Phase 6):
     The evaluator node will be inserted between integration and notification once
     implemented. Its import and node wiring are left as a TODO comment below.
 """

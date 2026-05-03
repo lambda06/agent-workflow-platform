@@ -46,3 +46,7 @@ Thumbs.db
 # ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
 logs/
+
+# Gmail Credentials
+credentials.json
+token.json

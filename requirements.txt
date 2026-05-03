@@ -18,3 +18,8 @@ upstash-redis==1.7.0       # Client for Upstash Redis caching
 langfuse==4.2.0            # Observability and tracing for LLM applications
 python-dotenv==1.2.2       # Local development support for loading .env files
 httpx==0.28.1              # Async HTTP client used by core integrations
+slack_sdk==3.34.0          # Slack Web API client (AsyncWebClient for bot verification)
+aiohttp==3.11.18           # Required async transport for slack_sdk's AsyncWebClient
+google-api-python-client==2.169.0  # Gmail REST API client (email_tools.py + verify_connections.py)
+google-auth-httplib2==0.2.0        # httplib2 transport for google-auth
+google-auth-oauthlib==1.2.2        # OAuth2 flow helpers for Google APIs
