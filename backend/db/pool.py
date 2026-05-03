@@ -144,7 +144,8 @@ def get_pool() -> AsyncConnectionPool:
 
         pool = get_pool()
         async with pool.connection() as conn:
-            row = await conn.fetchrow("SELECT ...")
+            cur = await conn.execute("SELECT ...")
+            row = await cur.fetchone()
 
     Returns:
         The initialised AsyncConnectionPool instance.

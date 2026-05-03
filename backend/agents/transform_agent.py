@@ -128,20 +128,26 @@ def _validate_invoice(invoice: dict) -> ValidationResult:
     errors: list[str] = []
 
     # ── Check 1: Required field presence ─────────────────────────────────────
-    missing = _REQUIRED_FIELDS - invoice.keys()
+    # A field is considered "missing" if the key is absent OR its value is None.
+    # email_tools.py uses model_dump(exclude_none=False) so Gemini-extracted fields
+    # that could not be parsed are always present in the dict as None, never absent.
+    missing = {
+        f for f in _REQUIRED_FIELDS
+        if invoice.get(f) is None
+    }
     if missing:
         errors.append(f"Missing required field(s): {', '.join(sorted(missing))}.")
 
     # ── Check 2: Arithmetic integrity ─────────────────────────────────────────
-    # Only run if total_amount is present — missing field is already caught above.
-    if "total_amount" in invoice:
+    # Only run if total_amount is a concrete number — None is caught by Check 1.
+    declared_total = invoice.get("total_amount")
+    if declared_total is not None:
         line_items: list[dict] = invoice.get("line_items", [])
         if line_items:
             calculated_total = sum(
                 item.get("quantity", 0) * item.get("unit_price", 0.0)
                 for item in line_items
             )
-            declared_total: float = invoice["total_amount"]
             discrepancy = abs(declared_total - calculated_total)
 
             if discrepancy > _AMOUNT_TOLERANCE:

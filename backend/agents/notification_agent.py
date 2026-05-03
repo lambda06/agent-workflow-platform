@@ -50,7 +50,7 @@ from typing import Optional
 
 from backend.db.pool import get_pool
 from backend.orchestration.state_manager import WorkflowState
-from backend.tools.mock_notification_tools import send_slack_notification
+from backend.tools.notification_tools import send_slack_notification
 
 logger = logging.getLogger(__name__)
 

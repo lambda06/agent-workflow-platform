@@ -20,9 +20,11 @@ DB connection strategy — shared psycopg3 pool:
             # conn is an async psycopg3 connection — use conn.execute(),
             # conn.fetchone(), conn.fetchall(), conn.transaction(), etc.
 
-Phase 4 replacement:
-    fetch_invoices_from_email() is swapped for a live Gmail MCP server call.
-    The rest of this node (DB persistence, state update) is unchanged.
+Phase 4 (complete):
+    fetch_invoices_from_email() now connects to the Gmail API via OAuth2,
+    fetches matching emails, and uses Gemini structured output to extract
+    invoice fields.  The rest of this node (DB persistence, state update)
+    is unchanged.
 
 Required Supabase table (run once before Phase 2):
     CREATE TABLE IF NOT EXISTS extracted_invoices (
@@ -39,7 +41,7 @@ from typing import Optional
 
 from backend.db.pool import get_pool
 from backend.orchestration.state_manager import WorkflowState
-from backend.tools.mock_email_tools import fetch_invoices_from_email
+from backend.tools.email_tools import fetch_invoices_from_email
 
 logger = logging.getLogger(__name__)
 

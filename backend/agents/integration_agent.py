@@ -52,8 +52,8 @@ from typing import Optional
 
 from backend.db.pool import get_pool
 from backend.orchestration.state_manager import WorkflowState
-from backend.tools.mock_api_tools import push_invoice_to_crm
-from backend.tools.mock_database_tools import insert_invoice_to_db
+from backend.tools.api_tools import push_invoice_to_crm
+from backend.tools.database_tools import insert_invoice_to_db
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +255,8 @@ async def integration_node(state: WorkflowState) -> dict:
                 "integration_node: calling DB and CRM tools concurrently for invoice '%s'.",
                 invoice_id,
             )
+
+            invoice["workflow_id"] = workflow_id
 
             db_result, crm_result = await asyncio.gather(
                 insert_invoice_to_db(invoice),

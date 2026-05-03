@@ -26,6 +26,31 @@ class Settings(BaseSettings):
         description="Langfuse instance URL"
     )
 
+    # --- CRM Integration (HubSpot) ---
+    hubspot_access_token: str = Field(..., description="HubSpot private app access token for CRM writes")
+
+    # --- Gmail (OAuth2 credentials for invoice extraction) ---
+    gmail_credentials_path: str = Field(
+        default="credentials.json",
+        description="Path to Google OAuth2 credentials JSON file",
+    )
+    gmail_token_path: str = Field(
+        default="token.json",
+        description="Path to the stored Gmail OAuth2 token JSON file",
+    )
+    gmail_search_query: str = Field(
+        default="subject:Invoice",
+        description="Gmail search query used by the extraction agent to find invoice emails",
+    )
+    gmail_processed_label_name: str = Field(
+        default="invoice-processed",
+        description="Gmail label applied to emails after successful invoice extraction, used to prevent re-processing",
+    )
+
+    # --- Slack (bot token for workflow notifications) ---
+    slack_bot_token: str = Field(..., description="Slack bot token (xoxb-...) for posting workflow summaries")
+    slack_channel_id: str = Field(..., description="Slack channel ID to post notifications into")
+
     # --- Application Setup ---
     environment: str = Field(
         default="development", 

@@ -1,14 +1,20 @@
 import asyncio
 import logging
+import os
 import sys
 
+import httpx
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from psycopg_pool import AsyncConnectionPool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langfuse import Langfuse
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from slack_sdk.web.async_client import AsyncWebClient
+from slack_sdk.errors import SlackApiError
 from upstash_redis.asyncio import Redis
 
-import os
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
 # Ensure this script is run from the project root: `python -m backend.verify_connections`
@@ -18,17 +24,23 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
 async def verify_postgres():
-    """Verify Supabase PostgreSQL connection by running a simple query."""
+    """Verify Supabase PostgreSQL connection using a one-shot psycopg3 pool."""
     logging.info("Checking Supabase PostgreSQL connection...")
     try:
-        engine = create_async_engine(settings.supabase_database_url)
-        async with engine.connect() as conn:
-            result = await conn.execute(text("SELECT 1"))
-            if result.scalar() == 1:
-                logging.info("✔ Supabase PostgreSQL connected successfully.")
-            else:
+        pool = AsyncConnectionPool(
+            conninfo=settings.supabase_database_url,
+            min_size=1,
+            max_size=2,
+            open=False,
+        )
+        await pool.open()
+        async with pool.connection() as conn:
+            cur = await conn.execute("SELECT 1")
+            row = await cur.fetchone()
+            if row[0] != 1:
                 raise Exception("Connected but received unexpected query result.")
-        await engine.dispose()
+        await pool.close()
+        logging.info("✔ Supabase PostgreSQL connected successfully.")
         return True
     except Exception as e:
         logging.error(f"❌ Postgres Error: {e}")
@@ -94,6 +106,99 @@ def verify_gemini():
         return False
 
 
+# ---------------------------------------------------------------------------
+# Gmail — Google API Python Client (same auth files the MCP server uses)
+# ---------------------------------------------------------------------------
+_GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+
+
+async def verify_gmail():
+    """Verify Gmail OAuth2 credentials and run a test search query."""
+    logging.info("Checking Gmail connection...")
+    try:
+        creds = None
+        token_path = settings.gmail_token_path
+        creds_path = settings.gmail_credentials_path
+
+        # Load cached token if it exists
+        if os.path.exists(token_path):
+            creds = Credentials.from_authorized_user_file(token_path, _GMAIL_SCOPES)
+
+        # Refresh or re-authorise if needed
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                # Non-interactive environments will raise here if credentials
+                # are missing — that is the correct behaviour for a health check.
+                flow = InstalledAppFlow.from_client_secrets_file(creds_path, _GMAIL_SCOPES)
+                creds = flow.run_local_server(port=0)
+            # Persist the refreshed token
+            with open(token_path, "w") as f:
+                f.write(creds.to_json())
+
+        service = build("gmail", "v1", credentials=creds)
+        result = (
+            service.users()
+            .messages()
+            .list(userId="me", q=settings.gmail_search_query, maxResults=10)
+            .execute()
+        )
+        count = result.get("resultSizeEstimate", 0)
+        logging.info(
+            f'✔ Gmail connected. Found {count} email(s) matching "{settings.gmail_search_query}".'
+        )
+        return True
+    except Exception as e:
+        logging.error(f"❌ Gmail Error: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# HubSpot — REST API via httpx
+# ---------------------------------------------------------------------------
+
+
+async def verify_hubspot():
+    """Verify HubSpot API access by fetching a single contact record."""
+    logging.info("Checking HubSpot connection...")
+    url = "https://api.hubapi.com/crm/v3/objects/contacts"
+    headers = {"Authorization": f"Bearer {settings.hubspot_access_token}"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers=headers, params={"limit": 1})
+        if response.status_code == 200:
+            logging.info("✔ HubSpot API — PASS (200 OK).")
+            return True
+        else:
+            raise Exception(f"Unexpected status {response.status_code}: {response.text[:200]}")
+    except Exception as e:
+        logging.error(f"❌ HubSpot Error: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Slack — slack_sdk AsyncWebClient
+# ---------------------------------------------------------------------------
+
+
+async def verify_slack():
+    """Verify Slack bot token by calling auth.test."""
+    logging.info("Checking Slack connection...")
+    try:
+        client = AsyncWebClient(token=settings.slack_bot_token)
+        response = await client.auth_test()
+        bot_name = response.get("bot_id") or response.get("user", "<unknown>")
+        logging.info(f"✔ Slack authenticated. Bot name: {response.get('user', bot_name)}.")
+        return True
+    except SlackApiError as e:
+        logging.error(f"❌ Slack API Error: {e.response['error']}")
+        return False
+    except Exception as e:
+        logging.error(f"❌ Slack Error: {e}")
+        return False
+
+
 async def main():
     logging.info("Starting diagnostic check for external services...\n")
 
@@ -105,8 +210,13 @@ async def main():
     lf_ok = verify_langfuse()
     gm_ok = verify_gemini()
 
+    # New async integration checks
+    gmail_ok = await verify_gmail()
+    hs_ok = await verify_hubspot()
+    sl_ok = await verify_slack()
+
     print("\n--- Diagnostic Results ---")
-    if all([pg_ok, rd_ok, lf_ok, gm_ok]):
+    if all([pg_ok, rd_ok, lf_ok, gm_ok, gmail_ok, hs_ok, sl_ok]):
         logging.info("🎉 All external services are correctly configured and reachable.")
         sys.exit(0)
     else:
@@ -115,4 +225,9 @@ async def main():
 
 
 if __name__ == "__main__":
+    # On Windows, asyncio.run() defaults to ProactorEventLoop which psycopg3
+    # cannot use. Force SelectorEventLoop before entering the event loop —
+    # the same fix applied in run.py for uvicorn. No-op on Linux/macOS.
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())

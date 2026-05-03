@@ -226,7 +226,7 @@ async def coordinator_node(state: WorkflowState) -> dict:
     #   - No manual JSON parsing or regex extraction is needed.
     # ----------------------------------------------------------------
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-3.1-flash-lite-preview",
         google_api_key=settings.gemini_api_key,
         temperature=0,          # deterministic planning; creativity adds noise here
     )

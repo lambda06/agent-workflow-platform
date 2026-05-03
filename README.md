@@ -29,7 +29,7 @@ The most interesting part of this project? **The workflow engine can retry intel
 Phase 1 ✅  Foundation        — Scaffold · Config · Models · Orchestration core
 Phase 2 ✅  Agent Nodes       — All 5 agents · StateGraph · Conditional routing · DB pool
 Phase 3 ✅  API Layer         — FastAPI · SSE streaming · Status endpoint · Checkpointing
-Phase 4 📋  MCP Integration   — Gmail · Postgres · REST · Slack (replace all mocks)
+Phase 4 ✅  Real Integrations  — Gmail OAuth2 · HubSpot CRM · Supabase DB · Slack (all mocks replaced)
 Phase 5 📋  Persistence       — Alembic migrations · Supabase schema · Results table
 Phase 6 📋  Evaluator Agent   — LLM-as-judge · Confidence scoring · Auto-correct/escalate
 Phase 7 📋  Deployment        — Docker · Dockerfile · docker-compose · Render · CI/CD · Auth middleware
@@ -224,6 +224,80 @@ Phase 7 📋  Deployment        — Docker · Dockerfile · docker-compose · Re
 
 ---
 
+## 🏗 Phase 4 — Real Integrations ✅
+
+**Goal:** Replace every mock tool with a live implementation wired to real external services. The agent pipeline now runs end-to-end against a real Gmail inbox, a real Supabase database, HubSpot CRM, and a Slack workspace — with no mocks in the critical path.
+
+### What was built
+
+- **Real Gmail Email Tool** (`backend/tools/email_tools.py`) — Replaces `mock_email_tools.py`. Implements `fetch_invoices_from_email()` against the live Gmail API:
+  - **OAuth2 credentials** loaded from `token.json` via `google.oauth2.credentials.Credentials.from_authorized_user_file()`. If the access token is expired, `google-auth` refreshes it automatically using the embedded refresh token — no manual re-authentication needed on every run.
+  - **Thread pool execution** — All `googleapiclient` calls are synchronous (blocking I/O). Every Gmail API call is wrapped in `asyncio.get_running_loop().run_in_executor(None, ...)` so the event loop is never blocked.
+  - **Gemini structured extraction** — Raw email body text is sent to `gemini-2.5-flash` via `ChatGoogleGenerativeAI.with_structured_output(InvoiceExtraction)`. The `InvoiceExtraction` Pydantic model has all fields typed as `Optional` — so emails where Gemini can’t extract a field return `None` for that field rather than raising a validation error. Temperature is set to `0` for deterministic extraction.
+  - **`InvoiceExtraction` Pydantic model** — Defines the structured output schema: `invoice_id`, `vendor_name`, `customer_name`, `customer_id`, `line_items` (list of `LineItem`), `total_amount`, `invoice_date`, `due_date`, `currency`, `status`. All optional to tolerate partial parses.
+  - **Per-email error isolation** — Each email is processed inside its own `try/except`. A single bad email (empty body, Gemini quota error, network blip) is logged and skipped — it never aborts the rest of the batch.
+  - **Gmail label deduplication** — After a successful extraction the message is tagged with the `invoice-processed` label via `messages().modify()`. The search query is automatically amended with `-label:invoice-processed` so Gmail itself filters already-processed messages at the API level. No already-labelled message is ever fetched, decoded, or sent to Gemini again. The label is only applied on success — a failed extraction leaves the message unlabelled so it is retried on the next run.
+  - **`_ensure_label_exists()`** — Called once per run. Lists all Gmail labels and creates `invoice-processed` if absent, returning the stable `label_id` for use in all `modify()` calls without an extra round-trip per message.
+  - **`GMAIL_SCOPES`** upgraded from `gmail.readonly` to `gmail.modify` to permit label writes.
+
+- **Real HubSpot CRM Tool** (`backend/tools/api_tools.py`) — Replaces `mock_api_tools.py`. Implements `push_invoice_to_crm()` using HubSpot's Deals API via `httpx.AsyncClient`:
+  - **Search-then-Create idempotency** — Before creating a deal, the tool searches HubSpot for an existing deal with the same `dealname` (`"{invoice_id} — {vendor_name}"`). If found, it returns the existing Deal ID with no write. This makes the function safe to call multiple times on the same invoice (e.g. during LangGraph retries) without creating duplicate deals.
+  - **Deal field mapping** — `dealname`, `amount`, `dealstage` (`appointmentscheduled`), `pipeline` (`default`), `closedate` (from `due_date`, only if present).
+
+- **Real Database Tool** (`backend/tools/database_tools.py`) — Replaces `mock_database_tools.py`. Writes validated invoices to a dedicated Supabase business records table using the shared `psycopg3` pool.
+
+- **Real Slack Notification Tool** (`backend/tools/notification_tools.py`) — Replaces `mock_notification_tools.py`. Posts workflow summaries to Slack via `slack_sdk.AsyncWebClient`, returning the message `ts` as a stable message ID for traceability.
+
+- **All agent imports updated** — `extraction_agent.py`, `integration_agent.py`, and `notification_agent.py` now import from the real tool modules. `workflow_id` is injected into the invoice dict before the concurrent DB/CRM calls so `database_tools.py` can namespace rows correctly.
+
+- **Developer reset utility** (`backend/tools/reset_invoice_labels.py`) — One-shot script to remove the `invoice-processed` label from all matching emails, resetting the inbox for a fresh extraction run. Used during development and testing to replay the pipeline without modifying Gmail manually.
+  ```
+  python -m backend.tools.reset_invoice_labels
+  ```
+
+- **`settings.py` extended** — Added `gmail_processed_label_name` (default: `invoice-processed`) so the label name is configurable per environment without a code change.
+
+### 🐛 Issues Encountered & Resolutions
+
+**Issue 1: `total_amount = None` causes `TypeError` in Transform Agent arithmetic**
+- **Where:** `backend/agents/transform_agent.py`, `_validate_invoice()` Check 2.
+- **Cause:** The mock tool omitted the `total_amount` key entirely for INV-2024-003, so `"total_amount" in invoice` returned `False` and the arithmetic was skipped. Real Gemini output uses `model_dump(exclude_none=False)`, which always serialises every field — so `total_amount` is present in the dict but set to `None` when the field couldn’t be extracted. The guard `"total_amount" in invoice` returned `True`, then `abs(None - 3.40)` raised `TypeError: unsupported operand type(s) for -: 'NoneType' and 'float'`.
+- **Fix:** Unified Check 1 and Check 2 to treat `None` values as missing:
+  - Check 1 changed from `_REQUIRED_FIELDS - invoice.keys()` to `{f for f in _REQUIRED_FIELDS if invoice.get(f) is None}` — catches both absent keys and `None` values.
+  - Check 2 changed from `if "total_amount" in invoice` to `declared_total = invoice.get("total_amount"); if declared_total is not None` — arithmetic is never attempted on `None`.
+
+**Issue 2: HubSpot 400 Bad Request — `currency` is not a valid deal property**
+- **Where:** `backend/tools/api_tools.py`, `_create_deal()`, line sending `"currency"` in the properties payload.
+- **Cause:** `currency` was included in the HubSpot deal create payload. The HubSpot Deals API does not accept `currency` as a per-deal property on the create endpoint — it is a portal-level setting. HubSpot returns `400 Bad Request` when unknown or unsupported properties are included.
+- **Fix:** Removed `"currency"` from the `properties` dict in `_create_deal()`. Added an inline comment explaining the omission so it is not accidentally re-added.
+
+**Issue 3: `NotNullViolation` on `crm_record_id` — schema mismatch with partial-success design**
+- **Where:** `backend/agents/integration_agent.py`, `_insert_integration_result()` — triggered after the HubSpot 400.
+- **Cause:** The `integration_agent` is explicitly designed for partial success: if one of the two concurrent tool calls (DB write, CRM push) fails, `asyncio.gather(return_exceptions=True)` still returns the successful result and sets the failed one to `None`. The row is then written with `NULL` for the failed column. However, the actual Supabase table was created with `crm_record_id TEXT NOT NULL` and `db_confirmation_id TEXT NOT NULL`, contradicting the nullable intent documented in the agent's docstring.
+- **Fix:** Migration applied in the Supabase SQL Editor:
+  ```sql
+  ALTER TABLE integration_results
+      ALTER COLUMN crm_record_id      DROP NOT NULL,
+      ALTER COLUMN db_confirmation_id DROP NOT NULL;
+  ```
+
+**Issue 4: Gmail label deduplication causes empty extraction on re-runs**
+- **Where:** `fetch_invoices_from_email()` search query, after the first successful run.
+- **Cause:** The search query `subject:Invoice -label:invoice-processed` correctly excludes already-processed emails. After the first successful run all 3 test emails were labelled, so subsequent runs returned 0 messages. The pipeline completed with no data.
+- **Fix:** Created `backend/tools/reset_invoice_labels.py` — a developer utility that searches for emails carrying the `invoice-processed` label and removes it via `messages().modify()`, making them visible to the extraction query again. Intended for development and test resets only.
+
+**Issue 5: OAuth scope upgrade requires `token.json` re-authentication**
+- **Where:** `backend/tools/email_tools.py` `GMAIL_SCOPES`, `backend/verify_connections.py`.
+- **Cause:** The original scope `gmail.readonly` does not permit `messages().modify()`, which is required to apply the processed label. Upgrading `GMAIL_SCOPES` to `gmail.modify` invalidates the existing `token.json` because the stored scopes no longer match.
+- **Fix:** Deleted the existing `token.json` and re-ran the OAuth flow via `python -m backend.verify_connections`. Google’s browser consent screen prompted for the new `modify` scope, producing a fresh `token.json` with the correct scope grant.
+
+**Issue 6: Gemini free-tier quota exhausted — `RESOURCE_EXHAUSTED 429`**
+- **Where:** `email_tools.py` Gemini extraction call, during the first smoke test run with real emails.
+- **Cause:** The free-tier daily quota for `gemini-2.0-flash` was already exhausted. The error is per-model-per-day on the free tier.
+- **Fix:** Upgraded the model in `email_tools.py` from `gemini-2.0-flash` to `gemini-2.5-flash`, which had available quota. Also noted for production: use a paid tier or implement exponential backoff with per-model fallback.
+
+---
+
 ## 📁 Project Structure
 
 ```
@@ -247,11 +321,13 @@ agent-workflow-platform/
 │   │   ├── state_manager.py      # WorkflowState TypedDict + get_initial_state()
 │   │   ├── error_handler.py      # ErrorClassifier, RetryConfig, execute_with_retry()
 │   │   └── langgraph_workflow.py # LangGraph StateGraph + get_runnable_workflow()
-│   ├── tools/                    # Mock tool implementations for agent use (Phase 2)
-│   │   ├── mock_api_tools.py
-│   │   ├── mock_database_tools.py
-│   │   ├── mock_email_tools.py
-│   │   └── mock_notification_tools.py
+│   ├── tools/                    # Tool implementations for agent use
+│   │   ├── email_tools.py        # Real Gmail OAuth2 extraction (Phase 4)
+│   │   ├── database_tools.py     # Real Supabase DB writes (Phase 4)
+│   │   ├── api_tools.py          # Real HubSpot CRM push (Phase 4)
+│   │   ├── notification_tools.py # Real Slack notifications (Phase 4)
+│   │   └── reset_invoice_labels.py # Dev utility — reset Gmail processed labels
+|   |
 │   ├── main.py                   # FastAPI app — lifespan · SSE stream · status endpoint
 │   └── verify_connections.py     # Diagnostic script for all external services
 ├── tests/                        # Test suite (Phase 4+)
@@ -317,6 +393,13 @@ agent-workflow-platform/
 | `LANGFUSE_PUBLIC_KEY` | ✅ | Langfuse public key for tracing |
 | `LANGFUSE_SECRET_KEY` | ✅ | Langfuse secret key for tracing |
 | `LANGFUSE_HOST` | ❌ | Langfuse instance URL (defaults to `https://cloud.langfuse.com`) |
+| `HUBSPOT_ACCESS_TOKEN` | ✅ | HubSpot private app access token for CRM deal writes |
+| `GMAIL_CREDENTIALS_PATH` | ❌ | Path to Google OAuth2 client secrets JSON (default: `credentials.json`) |
+| `GMAIL_TOKEN_PATH` | ❌ | Path to the stored Gmail OAuth2 token JSON (default: `token.json`) |
+| `GMAIL_SEARCH_QUERY` | ❌ | Gmail search query for invoice emails (default: `subject:Invoice`) |
+| `GMAIL_PROCESSED_LABEL_NAME` | ❌ | Gmail label applied after extraction to prevent re-processing (default: `invoice-processed`) |
+| `SLACK_BOT_TOKEN` | ✅ | Slack bot token (`xoxb-...`) for posting workflow summaries |
+| `SLACK_CHANNEL_ID` | ✅ | Slack channel ID to post notifications into |
 | `ENVIRONMENT` | ❌ | App environment — `development`, `staging`, `production` (defaults to `development`) |
 
 ---
